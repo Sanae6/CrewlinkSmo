@@ -1,11 +1,13 @@
-﻿using System.Drawing;
-using System.IO.MemoryMappedFiles;
+﻿using System.IO.MemoryMappedFiles;
 using System.Net;
 using System.Net.Sockets;
 using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
+using GlobalHook.Core.Keyboard;
+using GlobalHook.Core.Windows.Keyboard;
+using GlobalHook.Core.Windows.MessageLoop;
 
 namespace CrewlinkSmo;
 
@@ -16,8 +18,10 @@ public class Program {
 
     private static Socket Client = null!;
     private static UserInfo User;
+    private static Mutex KeyhookMutex = new Mutex();
+    private static bool GlobalActive = false;
 
-    public static async Task Main(string[] args) {
+    public async static Task Main(string[] args) {
         string name;
         IPAddress address;
         ushort port;
@@ -51,10 +55,10 @@ public class Program {
             Console.WriteLine($"Entered {name}");
         }
         // yeah but like they all use windows so who cares! :)))))))
-#pragma warning disable CA1416
+        #pragma warning disable CA1416
         MemoryMappedFile memMap = MemoryMappedFile.OpenExisting("MumbleLink", MemoryMappedFileRights.FullControl,
             HandleInheritability.None);
-#pragma warning restore CA1416
+        #pragma warning restore CA1416
         using MemoryMappedViewAccessor mmf = memMap.CreateViewAccessor(0, 0xD54);
         byte[] data = Encoding.Unicode.GetBytes("Super Mario Odyssey");
         mmf.WriteArray(0x2C, data, 0, data.Length);
@@ -62,31 +66,65 @@ public class Program {
         mmf.WriteArray(0x554, data, 0, data.Length);
         mmf.Write(0x0, 2);
         uint tick = 0;
-        Vector3 zero = Vector3.Zero;
         Client = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
         await Client.ConnectAsync(new IPEndPoint(address, port));
         ReceiveUserInfo();
         SendPings(name);
+        SetupHook();
         PeriodicTimer timer = new PeriodicTimer(TimeSpan.FromMilliseconds(25));
+        Console.Clear();
         while (true) {
             await timer.WaitForNextTickAsync();
             mmf.Write(0x4, unchecked(tick++));
             data = Encoding.Unicode.GetBytes(User.Id.ToString());
             mmf.WriteArray(0x250, data, 0, data.Length);
-            mmf.Write(0x8, ref User.Position);
-            mmf.Write(0x14, ref User.Front);
-            // mmf.Write(0x20, ref zero);
-            mmf.Write(0x22C, ref User.Position);
-            mmf.Write(0x238, ref User.Front);
-            // mmf.Write(0x244, ref zero);
-            mmf.Write(0x450, sizeof(ulong));
-            mmf.Write(0x454, User.LocationHash);
+            Vector3 finalPosition = User.Position + User.LocationOffset;
+            Vector3 front = User.Front;
+            if (GlobalActive) {
+                finalPosition = Vector3.Zero;
+                front = Vector3.UnitZ;
+            }
+            mmf.Write(0x8, ref finalPosition);
+            mmf.Write(0x14, ref front);
+            mmf.Write(0x22C, ref finalPosition);
+            mmf.Write(0x238, ref front);
+            mmf.Write(1104, sizeof(bool));
+            mmf.Write(1108, GlobalActive);
+            if (tick % 50 == 0) {
+                Console.Title = "CrewlinkSmo";
+                Console.CursorTop = 0;
+                Console.CursorLeft = 0;
+                Console.ResetColor();
+                Console.WriteLine("Mumble for SMO");
+                Console.WriteLine($"User: {name}");
+                Console.Write(new string(' ', Console.BufferWidth));
+                Console.CursorTop = 2;
+                Console.WriteLine(
+                    $"Position: {User.Position}, Speaking Globally: {GlobalActive}");
+            }
         }
         // ReSharper disable once FunctionNeverReturns
     }
+    private static void SetupHook() {
+        Thread thread = new Thread(() => {
+            KeyboardHook keyboardHook = new KeyboardHook();
+            keyboardHook.KeyDown += (_, args) => {
+                // Console.WriteLine($"balls {args}");
+                if ((args.Key & Keys.NumPad0) == Keys.NumPad0) {
+                    KeyhookMutex.WaitOne();
+                    GlobalActive = !GlobalActive;
+                    KeyhookMutex.ReleaseMutex();
+                }
+            };
+            Console.WriteLine($"Among {keyboardHook.CanBeInstalled}");
+            keyboardHook.Install();
+            new MessageLoop().Run(new []{keyboardHook}, ass => true);
+        });
+        thread.Start();
+    }
 
-    private static async void SendPings(string name) {
-        PeriodicTimer timer = new PeriodicTimer(TimeSpan.FromSeconds(3));
+    private async static void SendPings(string name) {
+        PeriodicTimer timer = new PeriodicTimer(TimeSpan.FromSeconds(1));
         byte[] data = new byte[PingSize];
 
         void Setup() {
@@ -104,7 +142,7 @@ public class Program {
         }
     }
 
-    private static async void ReceiveUserInfo() {
+    private async static void ReceiveUserInfo() {
         void Handling(Span<byte> span) {
             Data data = MemoryMarshal.Read<Data>(span);
             if (data.Magic != Magic) {
@@ -114,8 +152,7 @@ public class Program {
             User.Id = data.Id;
             User.Position = data.Position;
             User.Front = ToEulerAngles(data.Rotation);
-            User.LocationHash = data.LocationHash;
-            Console.WriteLine(User.LocationHash);
+            User.LocationOffset = new Vector3(data.LocationHash >> 32, 0, (data.LocationHash & 0xFFFFFF));
         }
 
         byte[] data = new byte[DataSize];
@@ -123,7 +160,8 @@ public class Program {
             // Console.WriteLine("Now waiting for packet");
             int bytesReceived = await Client.ReceiveAsync(data, SocketFlags.None);
             if (bytesReceived != DataSize) {
-                await Console.Error.WriteLineAsync($"Received incomplete buffer of size {bytesReceived}, expecting {DataSize}");
+                await Console.Error.WriteLineAsync(
+                    $"Received incomplete buffer of size {bytesReceived}, expecting {DataSize}");
                 continue;
             }
 
@@ -162,24 +200,5 @@ public class Program {
         public Vector3 Position;
         public Quaternion Rotation;
         public ulong LocationHash;
-    }
-
-    [StructLayout(LayoutKind.Auto)]
-    private struct Balls {
-        public uint Version;
-        public uint Tick;
-        public Vector3 Position;
-        public Vector3 Front;
-        public Vector3 Top;
-        public WCharPad Pad;
-        public Vector3 CamPosition;
-        public Vector3 CamFront;
-        public Vector3 CamTop;
-    }
-
-    [StructLayout(LayoutKind.Auto, Size = 512)]
-    private struct WCharPad {
-        public char FirstChar;
-        public Span<char> Data => MemoryMarshal.CreateSpan(ref FirstChar, 256);
     }
 }

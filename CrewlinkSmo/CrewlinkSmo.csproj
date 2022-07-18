@@ -7,4 +7,9 @@
         <Nullable>enable</Nullable>
     </PropertyGroup>
 
+    <ItemGroup>
+      <PackageReference Include="GlobalHook" Version="1.0.0" />
+      <PackageReference Include="GlobalHook.Windows" Version="1.0.0" />
+    </ItemGroup>
+
 </Project>
